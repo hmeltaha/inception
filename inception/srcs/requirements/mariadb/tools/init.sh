@@ -1,4 +1,3 @@
-
 #!/bin/bash
 set -e
 
@@ -8,35 +7,56 @@ ROOT_PASSWORD=$(cat /run/secrets/db_root_password)
 mkdir -p /run/mysqld
 chown mysql:mysql /run/mysqld
 
+# Initialize MariaDB only if the database is new.
 if [ ! -d /var/lib/mysql/mysql ]; then
     mariadb-install-db --user=mysql --datadir=/var/lib/mysql
 fi
 
+# Start MariaDB temporarily without network access.
 mariadbd --user=mysql --skip-networking \
     --socket=/run/mysqld/mysqld.sock &
 pid=$!
 
-until mariadb-admin ping --silent; do
+for i in $(seq 1 30); do
+    if mariadb-admin ping --silent; then
+        break
+    fi
+
+    if [ "$i" -eq 30 ]; then
+        echo "MariaDB failed to start"
+        exit 1
+    fi
+
     sleep 1
 done
 
-mariadb -u root <<SQL
+# Configure database and user only on first startup.
+if [ ! -f /var/lib/mysql/.inception_initialized ]; then
+    mariadb -u root <<SQL
 CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\`;
 CREATE USER IF NOT EXISTS '${MYSQL_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
-ALTER USER '${MYSQL_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
 GRANT ALL PRIVILEGES ON \`${MYSQL_DATABASE}\`.* TO '${MYSQL_USER}'@'%';
+ALTER USER 'root'@'localhost'
+IDENTIFIED VIA mysql_native_password USING PASSWORD('${ROOT_PASSWORD}')
+OR unix_socket;
 FLUSH PRIVILEGES;
 SQL
 
-if [ ! -f /var/lib/mysql/.root_password_set ]; then
-    mariadb -u root <<SQL
-ALTER USER 'root'@'localhost' IDENTIFIED BY '${ROOT_PASSWORD}';
-FLUSH PRIVILEGES;
-SQL
-    touch /var/lib/mysql/.root_password_set
+    touch /var/lib/mysql/.inception_initialized
 fi
 
-mariadb-admin -u root -p"${ROOT_PASSWORD}" shutdown
+# Verify MariaDB is accessible through the local Unix socket.
+mariadb -u root \
+    --protocol=socket \
+    --socket=/run/mysqld/mysqld.sock \
+    -e "SELECT 1;" >/dev/null
+
+# Shut down the temporary MariaDB server.
+mariadb-admin -u root \
+    --protocol=socket \
+    --socket=/run/mysqld/mysqld.sock shutdown
+
 wait "$pid"
 
+# Start MariaDB as the main container process.
 exec mariadbd --user=mysql --console
