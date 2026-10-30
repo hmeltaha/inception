@@ -4,3 +4,6 @@ srcs/.env
 
 *.log
 .DS_Store
+
+.env
+srcs/.env
